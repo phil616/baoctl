@@ -1,0 +1,7 @@
+/dist/
+/coverage.out
+*.test
+.env
+.env.*
+.mimocode/
+old_docs/

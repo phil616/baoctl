@@ -1,0 +1,9 @@
+.PHONY: build test check
+build:
+	mkdir -p dist
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/baoctl ./cmd/baoctl
+test:
+	go test -race ./...
+check:
+	go vet ./...
+	go test -race ./...
