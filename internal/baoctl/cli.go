@@ -16,11 +16,13 @@ import (
 	"slices"
 	"strings"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
 // Release builds set Version from the tag using the Go linker's -X flag.
 var Version = "0.1.0"
+
 const usage = `baoctl — 本机 OpenBao 配置同步（Linux amd64）
 
 用法：baoctl [--state-dir /etc/baoctl] <命令>
@@ -238,33 +240,66 @@ func (t *terminal) line(label, fallback string) (string, error) {
 	}
 	return line, nil
 }
-func (t *terminal) password(ctx context.Context) (string, error) {
+func (t *terminal) password(ctx context.Context) (password string, err error) {
 	fd := int(t.f.Fd())
-	state, err := term.GetState(fd)
+	state, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	if err != nil {
 		return "", errors.New("无法读取终端状态")
 	}
-	defer term.Restore(fd, state)
-	fmt.Fprint(t.f, "管理员密码（不回显）: ")
-	type result struct {
-		b   []byte
-		err error
+	// Disable echo before displaying the prompt: a fast terminal client can
+	// respond immediately. Keep canonical input and signal handling enabled.
+	hidden := *state
+	hidden.Lflag &^= unix.ECHO | unix.ECHONL
+	hidden.Lflag |= unix.ICANON | unix.ISIG
+	hidden.Iflag |= unix.ICRNL
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &hidden); err != nil {
+		return "", errors.New("无法关闭终端回显")
 	}
-	ch := make(chan result, 1)
-	go func() { b, err := term.ReadPassword(fd); ch <- result{b, err} }()
-	select {
-	case <-ctx.Done():
-		return "", errors.New("密码输入已取消")
-	case r := <-ch:
-		fmt.Fprintln(t.f)
-		if r.err != nil {
+	defer func() {
+		if restoreErr := unix.IoctlSetTermios(fd, unix.TCSETS, state); restoreErr != nil {
+			password = ""
+			err = errors.Join(err, errors.New("无法恢复终端状态"))
+		}
+	}()
+	if _, err := fmt.Fprint(t.f, "管理员密码（不回显）: "); err != nil {
+		return "", errors.New("无法显示密码提示")
+	}
+	// Poll in this goroutine so cancellation restores the terminal without a
+	// background ReadPassword later overwriting its restored state.
+	var secret []byte
+	defer func() { clear(secret) }()
+	var char [1]byte
+	defer clear(char[:])
+	for {
+		if ctx.Err() != nil {
+			return "", errors.New("密码输入已取消")
+		}
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, pollErr := unix.Poll(fds, 100)
+		if errors.Is(pollErr, unix.EINTR) {
+			continue
+		}
+		if pollErr != nil || fds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
 			return "", errors.New("密码读取失败")
 		}
-		defer clear(r.b)
-		if len(r.b) == 0 {
-			return "", errors.New("密码不能为空")
+		if n == 0 {
+			continue
 		}
-		return string(r.b), nil
+		n, readErr := unix.Read(fd, char[:])
+		if errors.Is(readErr, unix.EINTR) {
+			continue
+		}
+		if readErr != nil || n == 0 {
+			return "", errors.New("密码读取失败")
+		}
+		if char[0] == '\n' {
+			fmt.Fprintln(t.f)
+			if len(secret) == 0 {
+				return "", errors.New("密码不能为空")
+			}
+			return string(secret), nil
+		}
+		secret = append(secret, char[0])
 	}
 }
 
