@@ -36,21 +36,21 @@ func TestParseOptionalApps(t *testing.T) {
 
 func TestEmptyMachineState(t *testing.T) {
 	dir, s := testState(t)
-	s.Apps = []string{}
-	s.AppliedApps = nil
+	s.Targets = []Target{}
+	s.AppliedTargets = nil
 	s.Ready = true
 	s.RoleID, s.SecretID = "fictional-role", "fictional-secret"
 	if err := saveState(dir, s); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := loadState(dir)
-	if err != nil || !loaded.Ready || len(loaded.Apps) != 0 {
+	if err != nil || !loaded.Ready || len(loaded.Targets) != 0 {
 		t.Fatal("empty ready machine failed to round trip", err)
 	}
-	if strings.Contains(policy(s, s.Apps), "kv/") {
+	if strings.Contains(policy(s, s.Targets), "kv/") {
 		t.Fatal("empty machine has KV permissions")
 	}
-	if err := syncApp(context.Background(), nil, s, "app-a", 0, io.Discard); err == nil {
+	if err := syncTarget(context.Background(), nil, s, appTarget("app-a"), 0, io.Discard); err == nil {
 		t.Fatal("unregistered app accepted")
 	}
 	var out bytes.Buffer
@@ -67,7 +67,7 @@ func testState(t *testing.T) (string, *State) {
 	}
 	t.Cleanup(func() { os.RemoveAll(base) })
 	dir := filepath.Join(base, "state")
-	s := &State{Schema: 1, Address: "https://example.test", Machine: "test-machine", ID: "0123456789abcdef", OutputDir: filepath.Join(base, "env"), Apps: []string{"app-a"}}
+	s := &State{Schema: 2, Address: "https://example.test", Machine: "test-machine", ID: "0123456789abcdef", OutputDir: filepath.Join(base, "env"), Targets: []Target{appTarget("app-a")}}
 	if err := saveState(dir, s); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +185,11 @@ func TestClientRedactionAndRedirect(t *testing.T) {
 
 func mockSync(t *testing.T, s *State, readStatus, revokeStatus int, values map[string]any, policies []string) (*Client, *int) {
 	t.Helper()
+	return mockTargetSync(t, s, appTarget("app-a"), readStatus, revokeStatus, values, policies)
+}
+
+func mockTargetSync(t *testing.T, s *State, target Target, readStatus, revokeStatus int, values map[string]any, policies []string) (*Client, *int) {
+	t.Helper()
 	revoked := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -193,7 +198,9 @@ func mockSync(t *testing.T, s *State, readStatus, revokeStatus int, values map[s
 		case "/v1/auth/token/revoke-self":
 			revoked++
 			w.WriteHeader(revokeStatus)
-		case "/v1/kv/data/prod/apps/app-a/env":
+		case "/v1/sys/health":
+			fmt.Fprint(w, `{"initialized":true,"sealed":false}`)
+		case "/v1/" + target.kvPath():
 			if readStatus != 200 {
 				w.WriteHeader(readStatus)
 				return
@@ -226,7 +233,7 @@ func TestSyncFailClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, s := testState(t)
 			s.Ready = true
-			s.AppliedApps = s.Apps
+			s.AppliedTargets = s.Targets
 			s.RoleID = "fictional-role"
 			s.SecretID = "fictional-secret"
 			path := filepath.Join(s.OutputDir, "app-a.env")
@@ -239,7 +246,7 @@ func TestSyncFailClosed(t *testing.T) {
 			}
 			c, revoked := mockSync(t, s, tc.read, tc.revoke, tc.data, policies)
 			var out bytes.Buffer
-			if err := syncApp(context.Background(), c, s, "app-a", tc.expect, &out); err == nil {
+			if err := syncTarget(context.Background(), c, s, appTarget("app-a"), tc.expect, &out); err == nil {
 				t.Fatal("expected failure")
 			}
 			b, _ := os.ReadFile(path)
@@ -259,12 +266,12 @@ func TestSyncFailClosed(t *testing.T) {
 func TestSyncSuccessAndUnregistered(t *testing.T) {
 	_, s := testState(t)
 	s.Ready = true
-	s.AppliedApps = s.Apps
+	s.AppliedTargets = s.Targets
 	s.RoleID = "fictional-role"
 	s.SecretID = "fictional-secret"
 	c, revoked := mockSync(t, s, 200, 204, map[string]any{"PASSWORD": "fictional-new"}, []string{s.role()})
 	var out bytes.Buffer
-	if err := syncApp(context.Background(), c, s, "app-a", 2, &out); err != nil {
+	if err := syncTarget(context.Background(), c, s, appTarget("app-a"), 2, &out); err != nil {
 		t.Fatal(err)
 	}
 	if *revoked != 1 || strings.Contains(out.String(), "fictional-new") {
@@ -273,7 +280,7 @@ func TestSyncSuccessAndUnregistered(t *testing.T) {
 	if err := checkFile(filepath.Join(s.OutputDir, "app-a.env")); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncApp(context.Background(), c, s, "other", 0, io.Discard); err == nil {
+	if err := syncTarget(context.Background(), c, s, appTarget("other"), 0, io.Discard); err == nil {
 		t.Fatal("unregistered app accepted")
 	}
 	if *revoked != 1 {
@@ -283,7 +290,7 @@ func TestSyncSuccessAndUnregistered(t *testing.T) {
 
 func TestPolicyIsExactAndNoDefaults(t *testing.T) {
 	_, s := testState(t)
-	p := policy(s, s.Apps)
+	p := policy(s, s.Targets)
 	if strings.Contains(p, "*") || strings.Contains(p, "platform-admin") || !strings.Contains(p, `kv/data/prod/apps/app-a/env`) {
 		t.Fatal("policy too broad")
 	}

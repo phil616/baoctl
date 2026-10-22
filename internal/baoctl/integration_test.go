@@ -2,6 +2,7 @@ package baoctl
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -56,9 +56,92 @@ func TestOpenBao271Integration(t *testing.T) {
 	for _, app := range []string{"app-a", "app-b", "app-other"} {
 		must(c.call(ctx, "POST", "kv/data/prod/apps/"+app+"/env", root, map[string]any{"data": map[string]string{"PASSWORD": "fictional-test-value", "SPECIAL": `  $foo "x" 'y' \ # = end  `, "EMPTY": ""}}, false, nil))
 	}
+	// Seed distinct versions of the same name in every environment/type.
+	for _, classified := range []string{"prod", "test", "dev"} {
+		for _, typename := range []string{"apps", "files"} {
+			target := Target{"app-a", classified, typename}
+			if target == appTarget("app-a") {
+				continue
+			}
+			values := map[string]any{"MODE": classified}
+			if typename == "files" {
+				values = fileValues([]byte("hello"), "hello.txt")
+			}
+			must(c.call(ctx, "POST", target.kvPath(), root, map[string]any{"data": values}, false, nil))
+		}
+	}
+	t.Run("ClassifiedFilesAndRecovery", func(t *testing.T) {
+		dir, s := testState(t)
+		s.ID = "1123456789abcdef"
+		must(reconcile(ctx, c, root, dir, s))
+		// Upgrade an existing schema-1 installation against its real policy.
+		raw, err := json.Marshal(s)
+		must(err)
+		var legacy map[string]any
+		must(json.Unmarshal(raw, &legacy))
+		delete(legacy, "targets")
+		delete(legacy, "applied_targets")
+		legacy["schema"], legacy["apps"], legacy["applied_apps"] = 1, []string{"app-a"}, []string{"app-a"}
+		raw, err = json.Marshal(legacy)
+		must(err)
+		must(atomicWrite(filepath.Join(dir, "state.json"), raw))
+		s, err = loadState(dir)
+		must(err)
+		must(reconcile(ctx, c, root, dir, s))
+		must(syncTarget(ctx, c, s, appTarget("app-a"), 1, io.Discard))
+		firstRole, firstSecret := s.RoleID, s.SecretID
+		for _, target := range []Target{{"app-a", "test", "apps"}, {"app-a", "dev", "apps"}, {"app-a", "prod", "files"}, {"app-a", "test", "files"}, {"app-a", "dev", "files"}} {
+			token, err := c.machineLogin(ctx, s)
+			must(err)
+			_, err = c.readKV(ctx, token, target)
+			if !isStatus(err, 403) {
+				t.Fatal("unregistered environment/type readable")
+			}
+			must(c.revoke(token))
+			s.Targets = append(s.Targets, target)
+			sortTargets(s.Targets)
+			s.Ready = false
+			must(saveState(dir, s))
+			// Exercise recovery after policy write but before local commit.
+			must(c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Targets)}, false, nil))
+			s, err = loadState(dir)
+			must(err)
+			must(reconcile(ctx, c, root, dir, s))
+			must(reconcile(ctx, c, root, dir, s))
+			if s.RoleID != firstRole || s.SecretID != firstSecret {
+				t.Fatal("classified registration replaced identity")
+			}
+			must(syncTarget(ctx, c, s, target, 1, io.Discard))
+			if target.Typename == "files" {
+				got, err := os.ReadFile(filepath.Join(s.OutputDir, "app-a", target.Classified, "hello.txt"))
+				must(err)
+				if string(got) != "hello" {
+					t.Fatal("file payload changed")
+				}
+			}
+		}
+		must(doctor(ctx, c, s, io.Discard))
+		target := Target{"app-a", "test", "files"}
+		values := fileValues([]byte("new content"), "hello.txt")
+		values["SHA256"] = strings.Repeat("0", 64)
+		must(c.call(ctx, "POST", target.kvPath(), root, map[string]any{"data": values}, false, nil))
+		if err := syncTarget(ctx, c, s, target, 2, io.Discard); err == nil {
+			t.Fatal("bad digest accepted")
+		}
+		if err := doctor(ctx, c, s, io.Discard); err == nil {
+			t.Fatal("doctor accepted bad digest")
+		}
+		got, err := os.ReadFile(filepath.Join(s.OutputDir, "app-a", "test", "hello.txt"))
+		must(err)
+		if string(got) != "hello" {
+			t.Fatal("digest failure replaced old file")
+		}
+		// Restore valid content for the subsequent real CLI scenario.
+		must(c.call(ctx, "POST", target.kvPath(), root, map[string]any{"data": fileValues([]byte("hello"), "hello.txt")}, false, nil))
+	})
 	t.Run("EmptyMachineThenFirstApp", func(t *testing.T) {
 		dir, s := testState(t)
-		s.Apps = []string{}
+		s.Targets = []Target{}
 		if err := saveState(dir, s); err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +149,7 @@ func TestOpenBao271Integration(t *testing.T) {
 			t.Fatal(err)
 		}
 		firstRole, firstSecret := s.RoleID, s.SecretID
-		if !s.Ready || len(s.Apps) != 0 {
+		if !s.Ready || len(s.Targets) != 0 {
 			t.Fatal("empty machine not ready")
 		}
 		if err := reconcile(ctx, c, root, dir, s); err != nil {
@@ -76,7 +159,7 @@ func TestOpenBao271Integration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, readErr := c.readKV(ctx, token, "app-a")
+		_, readErr := c.readKV(ctx, token, appTarget("app-a"))
 		if err := c.revoke(token); err != nil {
 			t.Fatal(err)
 		}
@@ -90,10 +173,10 @@ func TestOpenBao271Integration(t *testing.T) {
 		if err := reconcile(ctx, c, root, dir, s); err == nil {
 			t.Fatal("deleted empty-machine policy recreated")
 		}
-		if err := c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Apps)}, false, nil); err != nil {
+		if err := c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Targets)}, false, nil); err != nil {
 			t.Fatal(err)
 		}
-		s.Apps = []string{"app-a"}
+		s.Targets = []Target{appTarget("app-a")}
 		s.Ready = false
 		if err := saveState(dir, s); err != nil {
 			t.Fatal(err)
@@ -104,7 +187,7 @@ func TestOpenBao271Integration(t *testing.T) {
 		if s.RoleID != firstRole || s.SecretID != firstSecret {
 			t.Fatal("adding first app replaced machine credentials")
 		}
-		if err := syncApp(ctx, c, s, "app-a", 1, io.Discard); err != nil {
+		if err := syncTarget(ctx, c, s, appTarget("app-a"), 1, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -119,10 +202,10 @@ func TestOpenBao271Integration(t *testing.T) {
 	}
 	must(c.revoke(admin.Auth.Token))
 	// Closing the bootstrap admin session must not invalidate machine credentials.
-	must(syncApp(ctx, c, s, "app-a", 1, io.Discard))
+	must(syncTarget(ctx, c, s, appTarget("app-a"), 1, io.Discard))
 	machine, err := c.machineLogin(ctx, s)
 	must(err)
-	_, err = c.readKV(ctx, machine, "app-other")
+	_, err = c.readKV(ctx, machine, appTarget("app-other"))
 	if !isStatus(err, 403) {
 		t.Fatal("unrelated application was not denied")
 	}
@@ -135,7 +218,7 @@ func TestOpenBao271Integration(t *testing.T) {
 		t.Fatal("machine can modify policy")
 	}
 	must(c.revoke(machine))
-	_, err = c.readKV(ctx, machine, "app-a")
+	_, err = c.readKV(ctx, machine, appTarget("app-a"))
 	if !isStatus(err, 403) {
 		t.Fatal("revoked token remains usable")
 	}
@@ -146,26 +229,26 @@ func TestOpenBao271Integration(t *testing.T) {
 	}
 	// Add another app while preserving the existing identity and app permissions.
 	s.Ready = false
-	s.Apps = append(s.Apps, "app-b")
-	slices.Sort(s.Apps)
+	s.Targets = append(s.Targets, appTarget("app-b"))
+	sortTargets(s.Targets)
 	must(saveState(dir, s))
 	must(reconcile(ctx, c, root, dir, s))
 	if s.SecretID != firstSecret {
 		t.Fatal("app add rotated identity")
 	}
-	must(syncApp(ctx, c, s, "app-b", 1, io.Discard))
-	must(syncApp(ctx, c, s, "app-a", 1, io.Discard))
+	must(syncTarget(ctx, c, s, appTarget("app-b"), 1, io.Discard))
+	must(syncTarget(ctx, c, s, appTarget("app-a"), 1, io.Discard))
 	// Simulate an interruption after policy write, before local commit.
 	s.Ready = false
-	s.Apps = append(s.Apps, "app-other")
+	s.Targets = append(s.Targets, appTarget("app-other"))
 	must(saveState(dir, s))
-	must(c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Apps)}, false, nil))
+	must(c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Targets)}, false, nil))
 	must(reconcile(ctx, c, root, dir, s))
 	if !s.Ready {
 		t.Fatal("pending intent not recovered")
 	}
 	// External changes must never be silently overwritten.
-	must(c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Apps) + "\n# external change\n"}, false, nil))
+	must(c.call(ctx, "PUT", "sys/policies/acl/"+s.role(), root, map[string]string{"policy": policy(s, s.Targets) + "\n# external change\n"}, false, nil))
 	if err := reconcile(ctx, c, root, dir, s); err == nil {
 		t.Fatal("policy drift overwritten")
 	}

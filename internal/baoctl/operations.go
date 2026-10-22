@@ -11,12 +11,12 @@ import (
 	"time"
 )
 
-func policy(s *State, apps []string) string {
+func policy(s *State, apps []Target) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Managed by baoctl; identity=%s\n", s.ID)
 	b.WriteString("path \"auth/token/revoke-self\" {\n  capabilities = [\"update\"]\n}\n")
 	for _, app := range apps {
-		fmt.Fprintf(&b, "path \"kv/data/prod/apps/%s/env\" {\n  capabilities = [\"read\"]\n}\n", app)
+		fmt.Fprintf(&b, "path \"%s\" {\n  capabilities = [\"read\"]\n}\n", app.kvPath())
 	}
 	return b.String()
 }
@@ -64,13 +64,13 @@ func reconcile(ctx context.Context, c *Client, admin, dir string, s *State) erro
 	if err := c.health(ctx); err != nil {
 		return err
 	}
-	for _, app := range s.Apps {
+	for _, app := range s.Targets {
 		kv, err := c.readKV(ctx, admin, app)
 		if err != nil {
-			return fmt.Errorf("应用 %s 预检失败（请先在 Web UI 创建其 KV v2 配置）: %w", app, err)
+			return fmt.Errorf("目标 %s 预检失败（请先在 Web UI 创建其 KV v2 配置）: %w", app, err)
 		}
-		if _, err = renderEnv(kv.Data.Data); err != nil {
-			return fmt.Errorf("应用 %s: %w", app, err)
+		if _, _, err = app.render(kv.Data.Data); err != nil {
+			return fmt.Errorf("目标 %s: %w", app, err)
 		}
 	}
 	policyPath := "sys/policies/acl/" + s.role()
@@ -84,11 +84,11 @@ func reconcile(ctx context.Context, c *Client, admin, dir string, s *State) erro
 		return err
 	}
 	missing := isStatus(err, 404)
-	wanted := policy(s, s.Apps)
-	if !missing && existing.Data.Policy != wanted && existing.Data.Policy != policy(s, s.AppliedApps) {
+	wanted := policy(s, s.Targets)
+	if !missing && existing.Data.Policy != wanted && existing.Data.Policy != policy(s, s.AppliedTargets) {
 		return errors.New("服务端 Policy 已被外部修改，拒绝覆盖；请核对本机权限")
 	}
-	if missing && (s.RoleID != "" || len(s.AppliedApps) > 0) {
+	if missing && (s.RoleID != "" || len(s.AppliedTargets) > 0) {
 		return errors.New("已管理的 Policy 被删除，拒绝自动重建")
 	}
 	// Inspect the role before any policy mutation.
@@ -184,31 +184,31 @@ func reconcile(ctx context.Context, c *Client, admin, dir string, s *State) erro
 		return err
 	}
 	var verifyErr error
-	for _, app := range s.Apps {
+	for _, app := range s.Targets {
 		var kv KV
 		kv, verifyErr = c.readKV(ctx, token, app)
 		if verifyErr == nil {
-			_, verifyErr = renderEnv(kv.Data.Data)
+			_, _, verifyErr = app.render(kv.Data.Data)
 		}
 		if verifyErr != nil {
-			verifyErr = fmt.Errorf("应用 %s 机器身份验证失败: %w", app, verifyErr)
+			verifyErr = fmt.Errorf("目标 %s 机器身份验证失败: %w", app, verifyErr)
 			break
 		}
 	}
 	if err := errors.Join(verifyErr, c.revoke(token)); err != nil {
 		return err
 	}
-	s.AppliedApps = slices.Clone(s.Apps)
+	s.AppliedTargets = slices.Clone(s.Targets)
 	s.Ready = true
 	return saveState(dir, s)
 }
 
-func syncApp(ctx context.Context, c *Client, s *State, app string, expectVersion int, out io.Writer) error {
+func syncTarget(ctx context.Context, c *Client, s *State, app Target, expectVersion int, out io.Writer) error {
 	if !s.Ready {
 		return errors.New("本机接入尚未完成，请交互运行 baoctl init 恢复")
 	}
-	if !slices.Contains(s.Apps, app) {
-		return errors.New("应用未在本机登记，请由管理员运行 app add")
+	if !slices.Contains(s.Targets, app) {
+		return errors.New("目标未在本机登记，请由管理员运行 app add 并指定相同分类")
 	}
 	if err := secureDir(s.OutputDir, true); err != nil {
 		return err
@@ -218,18 +218,18 @@ func syncApp(ctx context.Context, c *Client, s *State, app string, expectVersion
 		return err
 	}
 	kv, readErr := c.readKV(ctx, token, app)
-	// Revoke before publishing the env file. Failure leaves old output untouched.
+	// Revoke before publishing the output file. Failure leaves old output untouched.
 	if err := errors.Join(readErr, c.revoke(token)); err != nil {
 		return err
 	}
 	if expectVersion > 0 && kv.Data.Metadata.Version != expectVersion {
 		return errors.New("当前 KV 版本与 --expect-version 不符，已阻止发布")
 	}
-	data, err := renderEnv(kv.Data.Data)
+	name, data, err := app.render(kv.Data.Data)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(s.OutputDir, app+".env")
+	path := filepath.Join(app.outputDir(s.OutputDir), name)
 	if err := atomicWrite(path, data); err != nil {
 		return err
 	}

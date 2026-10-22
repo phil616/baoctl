@@ -8,12 +8,13 @@
 - 仅本机 CLI，无控制台服务、远程主机管理或常驻 Agent。
 - 管理员交互登录接入机器；CI 使用独立机器身份按需同步。
 - Web UI 管理 KV；部署前拉取，失败中止，旧容器继续运行。
-- 沿用 `kv/prod/apps/<APP>/env` 业务路径，不迁移已有生产数据。
+- 沿用 `kv/prod/apps/<APP>/env` 默认业务路径，扩展 prod/test/dev 与 apps/files，不迁移已有生产数据。
 
 ## 已实现能力
 
 - [x] Go CLI、固定依赖与 Linux amd64 构建。
 - [x] `init`、`app add`、`sync`、`status`、`doctor`。
+- [x] `--classified` 多环境、`--typename` 文件类、Base64 解码及 SHA256 校验、schema 1 登记兼容。
 - [x] 机器初始化与应用登记解耦：空应用 init、可选 --apps、后续首次 app add。
 - [x] HTTPS API、隐藏密码输入、Response Wrapping、机器只读身份。
 - [x] 私有文件、原子输出、格式校验、失败中止、并发锁。
@@ -46,4 +47,4 @@
 
 ## 后续候选功能
 
-机器凭据轮换、应用撤权/机器退役、受限接入账号、签名发行包与下载安装入口。多行秘密、Compose、多环境和远程编排不属于首版范围。
+机器凭据轮换、应用撤权/机器退役、受限接入账号、签名发行包与下载安装入口。Compose env-file 和远程编排暂不支持；多行秘密可通过文件类分发。

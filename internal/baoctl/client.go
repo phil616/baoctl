@@ -157,11 +157,14 @@ type KV struct {
 	} `json:"data"`
 }
 
-func (c *Client) readKV(ctx context.Context, token, app string) (KV, error) {
+func (c *Client) readKV(ctx context.Context, token string, target Target) (KV, error) {
 	var r KV
-	err := c.call(ctx, "GET", "kv/data/prod/apps/"+app+"/env", token, nil, false, &r)
+	if err := target.validate(); err != nil {
+		return r, err
+	}
+	err := c.call(ctx, "GET", target.kvPath(), token, nil, false, &r)
 	if err == nil && (r.Data.Data == nil || r.Data.Metadata.Version < 1 || r.Data.Metadata.Destroyed || r.Data.Metadata.DeletionTime != "") {
-		err = errors.New("应用 KV 为空、已删除或缺少有效版本")
+		err = errors.New("目标 KV 为空、已删除或缺少有效版本")
 	}
 	return r, err
 }

@@ -13,6 +13,7 @@
 | 在 Web UI 创建环境变量 | [创建应用配置](user-guide.md#3-在-openbao-创建应用配置) |
 | 初始化机器并接入首个应用 | [首次接入](user-guide.md#4-首次登记本机应用) |
 | 验证生成的 env | [同步与验证](user-guide.md#5-同步并验证首个应用) |
+| 使用测试/开发环境或还原文件密钥 | [多环境与文件类密钥](classified-files.md) |
 | 在同一机器增加应用 | [多应用管理](user-guide.md#6-同一台机器新增应用) |
 | 在 SSH 发布脚本中同步配置 | [CI/CD 接入](user-guide.md#7-接入-cicd) |
 | 修改变量并再次发布 | [配置更新](user-guide.md#8-修改配置与再次发布) |
