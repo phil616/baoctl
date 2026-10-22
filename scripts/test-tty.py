@@ -84,16 +84,33 @@ run("sync", "app-a", "--expect-version", "1")
 interactive(["app", "add", "app-b"], login_prompts())
 run("sync", "app-b")
 run("doctor")
+# Register the same name independently for each environment and type.
+for classified, typename, output in [
+    ("test", "apps", "/run/baoctl/app-a.env.test"),
+    ("dev", "apps", "/run/baoctl/app-a.env.development"),
+    ("prod", "files", "/run/baoctl/app-a/prod/hello.txt"),
+    ("test", "files", "/run/baoctl/app-a/test/hello.txt"),
+    ("dev", "files", "/run/baoctl/app-a/dev/hello.txt"),
+]:
+    arguments = ["app-a", "--classified", classified, "--typename", typename]
+    run("sync", *arguments, success=False)
+    interactive(["app", "add", *arguments], login_prompts())
+    interactive(["app", "add", *arguments], login_prompts())
+    run("sync", *arguments)
+    assert output.encode() in run("status"), "classified output absent from status"
+run("doctor")
+run("sync", "app-a", "--classified", "invalid", success=False)
+run("sync", "app-a", "--typename", "invalid", success=False)
 run("sync", "app-other", success=False)
 run("init", success=False)
 run("sync", "app-a", "--expect-version", "99", success=False)
 # Explicit empty --apps skips the optional prompt; populated --apps remains supported.
-for name, apps in [("empty", ""), ("populated", "app-a,app-b")]:
+for name, apps, classified, typename in [("empty", "", "prod", "apps"), ("populated", "app-a,app-b", "prod", "apps"), ("test-files", "app-a", "test", "files"), ("dev-apps", "app-a", "dev", "apps")]:
     state = "/etc/baoctl-" + name
     interactive(["--state-dir", state, "init", "--address", address,
                  "--machine", "cli-" + name, "--apps", apps,
-                 "--output-dir", "/run/baoctl-" + name],
+                 "--output-dir", "/run/baoctl-" + name, "--classified", classified, "--typename", typename],
                 [("输入 yes".encode(), b"yes"), *login_prompts()])
     run("--state-dir", state, "doctor")
-    run("--state-dir", state, "sync", "app-a", success=bool(apps))
+    run("--state-dir", state, "sync", "app-a", "--classified", classified, "--typename", typename, success=bool(apps))
 print("CLI terminal checks passed")

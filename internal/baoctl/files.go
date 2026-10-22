@@ -28,8 +28,8 @@ type State struct {
 	Machine        string   `json:"machine"`
 	ID             string   `json:"id"`
 	OutputDir      string   `json:"output_dir"`
-	Apps           []string `json:"apps"`
-	AppliedApps    []string `json:"applied_apps"`
+	Targets        []Target `json:"targets"`
+	AppliedTargets []Target `json:"applied_targets"`
 	Ready          bool     `json:"ready"`
 	RoleID         string   `json:"role_id,omitempty"`
 	SecretID       string   `json:"secret_id,omitempty"`
@@ -38,7 +38,7 @@ type State struct {
 
 func (s *State) role() string { return "baoctl-" + s.Machine + "-" + s.ID }
 func (s *State) validate() error {
-	if s.Schema != 1 {
+	if s.Schema != 2 {
 		return errors.New("不支持的本地状态版本")
 	}
 	if err := validateAddress(s.Address); err != nil {
@@ -58,22 +58,27 @@ func (s *State) validate() error {
 			return errors.New("不能复用现有 OpenBao/Agent 目录")
 		}
 	}
-	seen := map[string]bool{}
-	for _, app := range s.Apps {
-		if err := validName(app); err != nil {
+	seen := map[Target]bool{}
+	for _, app := range s.Targets {
+		if err := app.validate(); err != nil {
 			return err
 		}
 		if seen[app] {
-			return errors.New("应用列表重复")
+			return errors.New("登记目标重复")
 		}
 		seen[app] = true
 	}
-	for _, app := range s.AppliedApps {
+	applied := map[Target]bool{}
+	for _, app := range s.AppliedTargets {
+		if applied[app] {
+			return errors.New("已授权目标重复")
+		}
+		applied[app] = true
 		if !seen[app] {
-			return errors.New("状态不一致：已授权应用不在登记列表中")
+			return errors.New("状态不一致：已授权目标不在登记列表中")
 		}
 	}
-	if s.Ready && (s.RoleID == "" || s.SecretID == "" || !slices.Equal(s.Apps, s.AppliedApps)) {
+	if s.Ready && (s.RoleID == "" || s.SecretID == "" || !slices.Equal(s.Targets, s.AppliedTargets)) {
 		return errors.New("本地就绪状态与凭据/授权不一致")
 	}
 	return nil
@@ -188,6 +193,23 @@ func loadState(dir string) (*State, error) {
 	var s State
 	if json.Unmarshal(b, &s) != nil {
 		return nil, errors.New("本地状态 JSON 无效，内容已隐藏")
+	}
+	if s.Schema == 1 {
+		// Preserve ordering so existing managed policies remain byte-identical.
+		var legacy struct {
+			Apps        []string `json:"apps"`
+			AppliedApps []string `json:"applied_apps"`
+		}
+		if json.Unmarshal(b, &legacy) != nil || len(s.Targets) != 0 || len(s.AppliedTargets) != 0 {
+			return nil, errors.New("旧版本地状态无效，内容已隐藏")
+		}
+		for _, name := range legacy.Apps {
+			s.Targets = append(s.Targets, appTarget(name))
+		}
+		for _, name := range legacy.AppliedApps {
+			s.AppliedTargets = append(s.AppliedTargets, appTarget(name))
+		}
+		s.Schema = 2
 	}
 	if err := s.validate(); err != nil {
 		return nil, err

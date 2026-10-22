@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -29,20 +28,23 @@ const usage = `baoctl — 本机 OpenBao 配置同步（Linux amd64）
 
   init [--address URL] [--machine NAME] [--apps app1,app2]
        [--username admin] [--output-dir /run/baoctl]
+       [--classified prod|test|dev] [--typename apps|files]
        交互初始化机器身份或恢复接入；应用可留空，--apps 可选
-  app add <APP> [--username admin]
-       交互授权本机读取一个现有应用，保留已有授权
-  sync <APP> [--expect-version N]
-       自动认证、拉取最新 KV v2 配置、原子生成 env；失败返回非零
+  app add <APP> [--classified prod|test|dev] [--typename apps|files] [--username admin]
+       交互授权本机读取一个现有目标，保留已有授权
+  sync <APP> [--classified prod|test|dev] [--typename apps|files] [--expect-version N]
+       自动认证、拉取最新 KV v2 配置、原子生成文件；失败返回非零
   status
        仅查看本地登记及文件状态，不证明配置是最新版本
   doctor
-       检查连接、机器认证、所有登记应用读取及格式，不写 env
+       检查连接、机器认证、所有登记目标读取及格式，不写文件
   version
 
 初始化/授权的密码仅从终端隐藏输入，不接受密码参数或环境变量。
-除 help/version 外需 root。固定 KV 路径：kv/prod/apps/<APP>/env。
-sync 输出：/run/baoctl/<APP>.env（默认），root:root 0600。
+除 help/version 外需 root。KV 路径：kv/<classified>/<typename>/<APP>/env，默认 prod/apps。
+apps 输出：/run/baoctl/<APP>.env[.test|.development]，prod 无后缀。
+files 输出：/run/baoctl/<APP>/<classified>/<FILENAME>，解码并校验 SHA256。
+输出文件 root:root 0600。分类参数需在 app add 与 sync 时一致指定。
 `
 
 func flags(name string, w io.Writer) *flag.FlagSet {
@@ -108,6 +110,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return err
 		}
 		f := flags("app add", out)
+		target := targetFlags(f, args[2])
 		username := f.String("username", "admin", "管理员用户名")
 		if err := parse(f, args[3:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
@@ -118,6 +121,9 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if f.NArg() != 0 {
 			return errors.New("app add 含多余参数")
 		}
+		if err := target.validate(); err != nil {
+			return err
+		}
 		s, err := loadState(*dir)
 		if err != nil {
 			return err
@@ -126,17 +132,17 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return errors.New("存在未完成接入，请先运行 init 恢复")
 		}
 		return withAdmin(ctx, s, *username, out, func(c *Client, token string) error {
-			if !slices.Contains(s.Apps, args[2]) {
+			if !slices.Contains(s.Targets, *target) {
 				// Validate before saving intent to avoid pending state on simple typos.
-				kv, err := c.readKV(ctx, token, args[2])
+				kv, err := c.readKV(ctx, token, *target)
 				if err != nil {
 					return err
 				}
-				if _, err = renderEnv(kv.Data.Data); err != nil {
+				if _, _, err = target.render(kv.Data.Data); err != nil {
 					return err
 				}
-				s.Apps = append(s.Apps, args[2])
-				slices.Sort(s.Apps)
+				s.Targets = append(s.Targets, *target)
+				sortTargets(s.Targets)
 				s.Ready = false
 				if err := saveState(*dir, s); err != nil {
 					return err
@@ -145,7 +151,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			if err := reconcile(ctx, c, token, *dir, s); err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "应用 %s 已授权；运行 baoctl sync %s 生成文件\n", args[2], args[2])
+			fmt.Fprintf(out, "目标 %s 已授权；运行 baoctl sync %s --classified %s --typename %s 生成文件\n", target, target.Name, target.Classified, target.Typename)
 			return nil
 		})
 	case "sync":
@@ -156,11 +162,15 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return err
 		}
 		f := flags("sync", out)
+		target := targetFlags(f, args[1])
 		version := f.Int("expect-version", 0, "要求当前 KV 版本")
 		if err := parse(f, args[2:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
 				return nil
 			}
+			return err
+		}
+		if err := target.validate(); err != nil {
 			return err
 		}
 		if f.NArg() != 0 || *version < 0 {
@@ -174,7 +184,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return syncApp(ctx, c, s, args[1], *version, out)
+		return syncTarget(ctx, c, s, *target, *version, out)
 	case "status", "doctor":
 		if len(args) != 1 {
 			return errors.New("status/doctor 不接受额外参数")
@@ -305,11 +315,12 @@ func (t *terminal) password(ctx context.Context) (password string, err error) {
 
 func initialize(ctx context.Context, dir string, args []string, out io.Writer) error {
 	f := flags("init", out)
+	classification := targetFlags(f, "init")
 	address := f.String("address", "", "Server HTTPS 地址")
 	machine := f.String("machine", "", "机器名称")
 	apps := f.String("apps", "", "可选的逗号分隔应用名；留空仅初始化机器")
 	username := f.String("username", "admin", "管理员用户名")
-	output := f.String("output-dir", "", "env 输出目录")
+	output := f.String("output-dir", "", "文件输出目录")
 	if err := parse(f, args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -319,8 +330,15 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 	if f.NArg() != 0 {
 		return errors.New("init 含多余参数")
 	}
+	if err := classification.validate(); err != nil {
+		return err
+	}
 	appsProvided := false
+	classificationProvided := false
 	f.Visit(func(f *flag.Flag) {
+		if f.Name == "classified" || f.Name == "typename" {
+			classificationProvided = true
+		}
 		if f.Name == "apps" {
 			appsProvided = true
 		}
@@ -331,7 +349,7 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 	}
 	newState := s == nil
 	if s != nil {
-		if *address != "" || *machine != "" || appsProvided || *output != "" {
+		if *address != "" || *machine != "" || appsProvided || classificationProvided || *output != "" {
 			return errors.New("本机已登记；恢复请直接运行 init，新增应用请用 app add")
 		}
 		fmt.Fprintf(out, "核对/恢复本机 %s，身份 %s\n", s.Machine, s.role())
@@ -367,8 +385,14 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 		if _, err = rand.Read(id[:]); err != nil {
 			return errors.New("生成机器标识失败")
 		}
-		s = &State{Schema: 1, Address: strings.TrimRight(*address, "/"), Machine: *machine, ID: hex.EncodeToString(id[:]), OutputDir: *output}
-		s.Apps, err = parseApps(*apps)
+		s = &State{Schema: 2, Address: strings.TrimRight(*address, "/"), Machine: *machine, ID: hex.EncodeToString(id[:]), OutputDir: *output}
+		var names []string
+		names, err = parseApps(*apps)
+		for _, name := range names {
+			target := *classification
+			target.Name = name
+			s.Targets = append(s.Targets, target)
+		}
 		if err != nil {
 			return err
 		}
@@ -378,10 +402,10 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 		if err := secureDir(s.OutputDir, true); err != nil {
 			return err
 		}
-		if len(s.Apps) == 0 {
+		if len(s.Targets) == 0 {
 			fmt.Fprintf(t.f, "将初始化本机 %s 的机器身份，暂不授予任何应用读取权限。\n", s.Machine)
 		} else {
-			fmt.Fprintf(t.f, "将接入本机 %s，为 %s 创建只读身份；不操作现有 Agent。\n", s.Machine, strings.Join(s.Apps, ", "))
+			fmt.Fprintf(t.f, "将接入本机 %s，为 %s 创建只读身份；不操作现有 Agent。\n", s.Machine, strings.Join(names, ", "))
 		}
 		yes, err := t.line("继续？输入 yes", "")
 		if err != nil {
@@ -394,12 +418,12 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 	return withAdmin(ctx, s, *username, out, func(c *Client, token string) error {
 		if newState {
 			// Do not pin a typo or an inaccessible Server into local state.
-			for _, app := range s.Apps {
+			for _, app := range s.Targets {
 				kv, err := c.readKV(ctx, token, app)
 				if err != nil {
-					return fmt.Errorf("应用 %s 预检失败: %w", app, err)
+					return fmt.Errorf("目标 %s 预检失败: %w", app, err)
 				}
-				if _, err := renderEnv(kv.Data.Data); err != nil {
+				if _, _, err := app.render(kv.Data.Data); err != nil {
 					return err
 				}
 			}
@@ -410,10 +434,10 @@ func initialize(ctx context.Context, dir string, args []string, out io.Writer) e
 		if err := reconcile(ctx, c, token, dir, s); err != nil {
 			return fmt.Errorf("接入未完成；修复原因后运行 baoctl init 恢复: %w", err)
 		}
-		if len(s.Apps) == 0 {
+		if len(s.Targets) == 0 {
 			fmt.Fprintln(out, "本机身份已初始化并验证，尚未登记应用。创建应用 KV 后，用 baoctl app add <APP> 授权。")
 		} else {
-			fmt.Fprintln(out, "本机身份与所有应用读取权限已验证。用 baoctl sync <APP> 生成 env。")
+			fmt.Fprintln(out, "本机身份与所有登记目标读取权限已验证。用 baoctl sync <APP> 并指定相同分类参数生成文件。")
 		}
 		return nil
 	})
@@ -483,24 +507,26 @@ func withAdmin(ctx context.Context, s *State, username string, out io.Writer, fn
 
 func status(s *State, out io.Writer) error {
 	fmt.Fprintf(out, "机器：%s\nServer：%s\n身份：%s\n接入完成：%t\n", s.Machine, s.Address, s.role(), s.Ready)
-	if len(s.Apps) == 0 {
+	if len(s.Targets) == 0 {
 		fmt.Fprintln(out, "尚未登记应用；创建应用 KV 后，用 baoctl app add <APP> 授权。")
 	}
-	for _, app := range s.Apps {
-		path := filepath.Join(s.OutputDir, app+".env")
-		if err := secureDir(s.OutputDir, false); err != nil {
-			fmt.Fprintf(out, "%s：输出目录不存在或权限异常\n", app)
+	for _, app := range s.Targets {
+		paths, err := localOutputPaths(s.OutputDir, app)
+		if err != nil || len(paths) == 0 {
+			fmt.Fprintf(out, "%s：文件不存在或目录权限异常\n", app)
 			continue
 		}
-		if err := checkFile(path); err != nil {
-			fmt.Fprintf(out, "%s：文件不存在或权限异常\n", app)
-			continue
+		for _, path := range paths {
+			if err := checkFile(path); err != nil {
+				fmt.Fprintf(out, "%s：文件不存在或权限异常\n", app)
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "%s：文件存在，写入时间 %s，%s\n", app, info.ModTime().Format("2006-01-02T15:04:05Z07:00"), path)
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "%s：文件存在，写入时间 %s，%s\n", app, info.ModTime().Format("2006-01-02T15:04:05Z07:00"), path)
 	}
 	fmt.Fprintln(out, "本地文件存在不代表最新配置；发布前必须成功执行 sync。")
 	return nil
@@ -514,7 +540,7 @@ func doctor(ctx context.Context, c *Client, s *State, out io.Writer) (result err
 		return err
 	}
 	fmt.Fprintln(out, "Server：可达，已初始化且未封印")
-	if len(s.Apps) > 0 {
+	if len(s.Targets) > 0 {
 		if err := secureDir(s.OutputDir, false); err != nil {
 			return errors.New("输出目录缺失或权限异常；重启后请先运行 sync 生成运行时目录")
 		}
@@ -525,19 +551,19 @@ func doctor(ctx context.Context, c *Client, s *State, out io.Writer) (result err
 	}
 	defer func() { result = errors.Join(result, c.revoke(token)) }()
 	fmt.Fprintln(out, "机器认证：通过，Token 策略与有效期符合预期")
-	if len(s.Apps) == 0 {
+	if len(s.Targets) == 0 {
 		fmt.Fprintln(out, "尚未登记应用；未执行应用配置检查。")
 	}
-	for _, app := range s.Apps {
+	for _, app := range s.Targets {
 		kv, err := c.readKV(ctx, token, app)
 		if err != nil {
-			return fmt.Errorf("应用 %s: %w", app, err)
+			return fmt.Errorf("目标 %s: %w", app, err)
 		}
-		if _, err := renderEnv(kv.Data.Data); err != nil {
-			return fmt.Errorf("应用 %s: %w", app, err)
+		if _, _, err := app.render(kv.Data.Data); err != nil {
+			return fmt.Errorf("目标 %s: %w", app, err)
 		}
 		fmt.Fprintf(out, "%s：读取及格式通过，KV 版本 %d\n", app, kv.Data.Metadata.Version)
 	}
-	fmt.Fprintln(out, "未修改 env，也未检查 Docker 业务健康。")
+	fmt.Fprintln(out, "未修改输出文件，也未检查 Docker 业务健康。")
 	return nil
 }

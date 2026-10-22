@@ -11,7 +11,7 @@ import (
 var envKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Docker --env-file preserves quotes, dollar signs and backslashes literally.
-// Restrict v1 to string values with no control bytes; never source this file.
+// Restrict application secrets to string values with no control bytes; never source this file.
 func renderEnv(values map[string]any) ([]byte, error) {
 	if len(values) == 0 {
 		return nil, errors.New("应用没有环境变量，拒绝生成空文件")
@@ -30,7 +30,7 @@ func renderEnv(values map[string]any) ([]byte, error) {
 		}
 		for _, r := range s {
 			if r < 32 || r == 127 {
-				return nil, errors.New("环境变量含换行或控制字符；第一版仅支持单行字符串")
+				return nil, errors.New("环境变量含换行或控制字符；应用类仅支持单行字符串")
 			}
 		}
 		if len(k)+len(s)+1 > 60000 {

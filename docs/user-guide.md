@@ -2,7 +2,7 @@
 
 [文档索引](README.md) · [项目首页](../README.md)
 
-适用于 baoctl 0.1.0、Debian/Ubuntu、Linux amd64。本文从一台新机器开始，说明如何准备应用配置、登记本机应用、生成 env，并交给已有 Docker 发布脚本使用。
+适用于当前 baoctl、Debian/Ubuntu、Linux amd64。本文从一台新机器开始，说明如何准备应用配置、登记本机应用、生成 env，并交给已有 Docker 发布脚本使用。
 
 本文中的 `openbao.example.com`、`example-node-02`、`my-api`、`order-worker` 均为通用示例。域名必须替换为自己的 OpenBao 地址，机器名和应用名按实际用途填写；示例 JSON 只含虚构测试数据。
 
@@ -10,7 +10,7 @@
 
 ### 1.1 先理解三个操作
 
-baoctl 中的“应用”就是一个名称与一份 OpenBao 环境变量配置的对应关系，不是安装包，也不是 Docker 容器。
+baoctl 以“环境 + 类型 + 名称”标识一份 OpenBao 配置。本篇以默认 `prod/apps` 演示；测试/开发环境、文件类及完整参数见 [多环境与文件类密钥](classified-files.md)。
 
 | 操作 | 在哪里做 | 结果 |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ uname -m
 | 工具内部读取的 API 路径，无需手工配置 | `kv/data/prod/apps/my-api/env` |
 | 本机默认生成文件 | `/run/baoctl/my-api.env` |
 
-业务路径不放机器名。同一应用部署到多台机器时可以共用这份配置；如果应用实例需要不同配置，应使用不同应用名及独立 KV，例如 `my-api-staging` 和 `my-api-prod`。
+业务路径不放机器名。同一应用部署到多台机器时可以共用这份配置；不同环境通过 `--classified test` 或 `--classified dev` 选择独立 KV。同一环境内需要不同配置的实例可以使用不同名称。
 
 ## 2. 安装程序
 

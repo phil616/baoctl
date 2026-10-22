@@ -11,7 +11,7 @@
 ## 数据流
 
 ```text
-管理员：Web UI 修改 kv/prod/apps/<APP>/env
+管理员：Web UI 修改 kv/<classified>/<typename>/<NAME>/env
 
 首次接入 / 新增应用：
 可信主机终端输入管理员密码
@@ -36,7 +36,7 @@
 
 新身份命名 `baoctl-<machine>-<16位随机十六进制标识>`。一个安装实例一个 AppRole、一个同名 Policy；不同主机各自初始化，禁止复制状态文件或把已接入机器的凭据包含在克隆镜像中。
 
-Policy 只包含登记应用的精确 `kv/data/prod/apps/<APP>/env` `read` 和 `auth/token/revoke-self` `update`。没有业务写入、全局通配符、Policy 管理权限或默认 Policy。AppRole 禁用附加 default Policy，使用 service Token：TTL 5 分钟，最大及显式最大 TTL 10 分钟，不续租，每次命令结束主动撤销。
+Policy 只包含登记应用的精确 `kv/data/<classified>/<typename>/<NAME>/env` `read` 和 `auth/token/revoke-self` `update`。没有业务写入、全局通配符、Policy 管理权限或默认 Policy。AppRole 禁用附加 default Policy，使用 service Token：TTL 5 分钟，最大及显式最大 TTL 10 分钟，不续租，每次命令结束主动撤销。
 
 `init` 不要求应用：空机器的 Policy 仅含撤销自身 Token 的权限，不含任何 KV 路径。空机器也可以完成接入并标记为 ready；这个状态表示机器认证已验证，不表示存在应用。后续 `app add` 追加应用权限并验证读取，复用原机器凭据。`--apps` 是初始化时同时登记应用的可选快捷方式。
 
@@ -48,7 +48,7 @@ SecretID 为长期、可多次使用的独立机器凭据，支持无人值守�
 
 ## 可恢复性
 
-状态保存 `apps`（期望授权）、`applied_apps`（最后完成授权）、`ready`、安装标识与机器凭据。管理操作先保存待完成意图。服务端 Policy 必须等于上次完成版本或当前期望版本，才能继续；其他差异被视为外部变更。角色参数也会完整核对，不直接覆盖已有角色。
+schema 2 状态保存 `targets`（期望授权）、`applied_targets`（最后完成授权）、`ready`、安装标识与机器凭据；每个授权目标记录名称、环境和类型。管理操作先保存待完成意图。服务端 Policy 必须等于上次完成版本或当前期望版本，才能继续；其他差异被视为外部变更。角色参数也会完整核对，不直接覆盖已有角色。
 
 一旦取得 SecretID 就立即保存；后续重试复用它。若落盘失败，尝试按 accessor 撤销新 SecretID。极端情况下（服务端签发成功后网络中断或进程被强杀）可能留下未保存的 SecretID，需要管理员通过服务端 accessor 清理。本工具不声称客户端与服务端之间存在原子事务。
 
@@ -58,7 +58,7 @@ SecretID 为长期、可多次使用的独立机器凭据，支持无人值守�
 
 ## 文件与网络
 
-默认凭据文件 `/etc/baoctl/state.json`，root:root 0600；目录 0700。env 输出 `/run/baoctl/<APP>.env`，同样 root:root 0600，目录 0700。程序检查路径祖先的所有者和可写权限，拒绝符号链接及非普通文件；不自动 chmod 既有不安全目录。
+默认凭据文件 `/etc/baoctl/state.json`，root:root 0600；目录 0700。应用类输出 `/run/baoctl/<APP>.env`，test/dev 分别添加 `.test`/`.development`；文件类输出 `/run/baoctl/<NAME>/<classified>/<FILENAME>`。同样 root:root 0600，目录 0700。程序检查路径祖先的所有者和可写权限，拒绝符号链接及非普通文件；不自动 chmod 既有不安全目录。
 
 正式客户端仅 HTTPS、TLS 1.2+、系统信任链，无跳过 TLS 校验开关，无自动 HTTP 重定向，不读取代理环境变量。客户端默认请求超时 20 秒，清理 Token 使用独立的 10 秒超时。HTTP 错误只显示状态码和固定说明，不打印服务端响应体、请求体或底层可能包含输入值的异常。
 
@@ -68,9 +68,11 @@ env 不承诺原子更新多个 APP；每次只同步一个。无自动离线回
 
 ## 格式选择
 
-首版只针对 Docker CLI 的 env-file，所有值必须为单行字符串。保留字面引号、美元符号、反斜杠、空格，不做 shell 转义。按键名排序生成确定性输出。禁止多行、控制字符和隐式类型转换，避免注入额外变量或改变配置语义。
+应用类针对 Docker CLI 的 env-file，所有值必须为单行字符串。保留字面引号、美元符号、反斜杠、空格，不做 shell 转义。按键名排序生成确定性输出。禁止多行、控制字符和隐式类型转换，避免注入额外变量或改变配置语义。
 
-上游 KV 就是该 APP 的变量集合，不另行引入模板或字段契约。如未来需要同一 KV 的字段子集或多行秘密，另行设计，不通过自动转义猜测消费者行为。
+应用类上游 KV 是该 APP 的变量集合，不另行引入模板。文件类 KV 固定包含 `B64`、`FILENAME`、`SHA256` 三个字符串字段：移除 B64 中的单双引号，按标准 Base64 解码，校验原始字节的 SHA256，再原子替换文件。文件名只允许单个名称，拒绝目录穿越。多行或二进制秘密使用文件类。
+
+授权使用完整目标路径，不以通配符扩大到其他环境或类型。schema 1 读取时映射到 prod/apps，保留旧 Policy 文本顺序及原凭据，下一次管理操作保存为 schema 2。详见 [多环境与文件类密钥](classified-files.md)。
 
 ## 官方依据
 
