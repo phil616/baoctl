@@ -40,6 +40,37 @@ func TestFileDecode(t *testing.T) {
 	}
 }
 
+func TestFileDigestWithFilename(t *testing.T) {
+	const digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	for _, tc := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{"plain", digest, true},
+		{"single space", digest + " rootca.crt", true},
+		{"sha256sum", digest + "  rootca.crt", true},
+		{"binary marker", digest + " *rootca.crt", true},
+		{"ignored filename", strings.ToUpper(digest) + "  ../../different file.crt", true},
+		{"trailing space", digest + " ", true},
+		{"invalid hex", strings.Repeat("g", 64) + "  rootca.crt", false},
+		{"short digest", "2cf24dba  rootca.crt", false},
+		{"mismatch", strings.Repeat("0", 64) + "  rootca.crt", false},
+		{"missing digest", " rootca.crt", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := map[string]any{"B64": "aGVsbG8=", "FILENAME": "hello.txt", "SHA256": tc.value}
+			name, data, err := decodeFile(values)
+			if (err == nil) != tc.valid {
+				t.Fatal("unexpected digest validation result", err)
+			}
+			if tc.valid && (name != "hello.txt" || string(data) != "hello") {
+				t.Fatal("digest suffix affected output filename or content")
+			}
+		})
+	}
+}
+
 func TestTargetSyncPathsAndIsolation(t *testing.T) {
 	for _, classified := range []string{"prod", "test", "dev"} {
 		for _, typename := range []string{"apps", "files"} {

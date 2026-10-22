@@ -40,7 +40,7 @@ sudo baoctl sync altasci-email-platform --classified test
 | --- | --- |
 | `B64` | 原始文件的标准 Base64 编码；单引号和双引号会被移除后解码 |
 | `FILENAME` | 单个文件名，例如 `hello.txt`；不能包含目录、`..` 路径、斜杠或控制字符 |
-| `SHA256` | 原始文件的 64 位十六进制 SHA256 摘要，字母大小写均可 |
+| `SHA256` | 原始文件的 64 位十六进制 SHA256 摘要，字母大小写均可；兼容 `摘要  文件名`，仅取第一个空格前的摘要，后面的内容直接丢弃，文件名仍由 `FILENAME` 指定 |
 
 在 Web UI 的 `kv/` 下创建 `test/files/altasci-email-file/env`，填写以下 JSON。这里的原始内容是 **hello，不包含末尾换行**：
 

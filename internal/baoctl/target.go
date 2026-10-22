@@ -108,6 +108,8 @@ func decodeFile(values map[string]any) (string, []byte, error) {
 	if name == "" || name == "." || name == ".." || len(name) > 255 || !utf8.ValidString(name) || strings.ContainsAny(name, "/\\") || strings.ContainsFunc(name, unicode.IsControl) || strings.HasPrefix(name, ".baoctl-") {
 		return "", nil, errors.New("FILENAME 必须是有效的单个文件名，不能包含路径或控制字符，内容已隐藏")
 	}
+	// Accept sha256sum output; discard the space and everything after it.
+	digest, _, _ = strings.Cut(digest, " ")
 	want, err := hex.DecodeString(digest)
 	if err != nil || len(want) != sha256.Size {
 		return "", nil, errors.New("SHA256 必须是 64 位十六进制摘要，内容已隐藏")
