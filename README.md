@@ -26,6 +26,45 @@ CI/CD 通过 SSH 执行 baoctl sync my-api
 现有发布脚本执行 docker run --env-file ...
 ```
 
+## 使用
+env文件或初始化文件中,需要在OpenBaoServer中,建立如下机制
+```
+<classified prod|test|dev>/<typename apps|files>/<appname string>/env
+```
+
+例如
+
+```
+prod/apps/note/env
+```
+标识生产环境,APP初始化类型,note项目,env文件
+
+### 1. ENV变量注入
+
+env文件注入会写入到/run/baoctl/<appname>.env中,如果项目支持通过文件写入,则可指定这个文件,如果不支持,则可以通过systemd注入环境变量.
+
+如果使用OpenBao Server GUI编辑,可以使用根目录的 env2json.sh 脚本进行JSON转换,例如
+```
+bash env2json.sh .env | tee config.json
+```
+
+### 2. 普通文件
+
+普通文件类型的env有特殊格式,env字段名必须要满足下列格式:
+1. B64: Base64编码的文件原始内容
+2. FILENAME: 预计保存的文件名
+3. SHA256: 使用SHA256对原始文件的计算方式
+
+对于需要复杂的配置文件,yaml配置,证书,密钥等,可以使用普通文件加载.
+
+对文件进行base64编码和sha256摘要:
+```
+echo "==="
+base64 -w 0 .env
+echo ""
+sha256sum .env
+```
+
 ## 安装
 
 ### 使用 Release 二进制
